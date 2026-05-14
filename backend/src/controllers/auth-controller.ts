@@ -11,7 +11,6 @@ export async function signup(req: Request, res: Response): Promise<void> {
     sendValidationError(res, parsedBody.error);
     return;
   }
-
   const { username, password } = parsedBody.data;
   const hashedPassword = await bcrypt.hash(password, 10);
 
@@ -35,4 +34,36 @@ export async function signup(req: Request, res: Response): Promise<void> {
 
 export async function signin(req: Request, res: Response): Promise<void> {
   //TODO: Implement signin logic
+  const signInBody = req.body;
+  const parsedBody = authSchema.safeParse(signInBody);
+  if (!parsedBody.data){
+    res.status(403).json({error : "Incorrect"});
+    return;
+  }
+
+  //Check if user exists
+  const checkUser = await prisma.user.findUnique({
+    where : {   
+      username : parsedBody.data?.username
+    }
+  })
+
+  if (!checkUser){
+    res.status(404).json({error : "User Not Found"});
+    return;
+  }
+
+  //Match the password
+  const checkPassword = await bcrypt.compare(parsedBody.data?.password!, checkUser.password);
+  if (!checkPassword){
+    res.status(403).json({
+      error : "Invalid Password"
+    })
+    return;
+  }
+
+  res.status(200).json({
+    token : createToken({userId : checkUser.id})
+  })
 }
+

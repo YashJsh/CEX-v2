@@ -18,6 +18,7 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "@prisma/adapter-libsql": "^7.8.0",
     "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "^7.8.0",
     "bcryptjs": "^3.0.2",

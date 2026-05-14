@@ -22,7 +22,7 @@ export function waitForEngineResponse(
       resolve,
       reject,
       timeout,
-    });
+    })
   });
 }
 

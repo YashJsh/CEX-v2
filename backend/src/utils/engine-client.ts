@@ -10,10 +10,12 @@ import type {
   EngineResponse,
 } from "../types/engine.js";
 
+//Creating client 
 const publisher = createClient({ url: env.redisUrl }).on("error", (error) => {
   console.error("Redis publisher error", error);
 });
 
+//Subscriber client to listen for engine responses
 const subscriber = createClient({ url: env.redisUrl }).on("error", (error) => {
   console.error("Redis subscriber error", error);
 });
@@ -32,7 +34,6 @@ export async function sendToEngine(
 ): Promise<EngineResponse> {
   const correlationId = crypto.randomUUID();
   const responsePromise = waitForEngineResponse(correlationId, env.engineTimeoutMs);
-
   const message: EngineRequest = {
     correlationId,
     responseQueue: env.responseQueue,
@@ -41,12 +42,14 @@ export async function sendToEngine(
   };
 
   await publisher.lPush(env.incomingQueue, JSON.stringify(message));
+  
   return responsePromise;
 }
 
 export async function listenForEngineResponses(): Promise<void> {
   console.log(`Listening for engine responses on ${env.responseQueue}`);
 
+  //Infinite loop
   for (;;) {
     const response = await subscriber.brPop(env.responseQueue, 0);
     if (!response) continue;

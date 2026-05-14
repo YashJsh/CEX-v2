@@ -13,7 +13,64 @@ datasource db {
 }
 
 model User {
-  id       String @id @default(uuid())
-  username String @unique
+  id       String  @id @default(uuid())
+  username String  @unique
   password String
+  orders   Order[]
+  fills    Fills[]
+}
+
+model Stocks {
+  id     String @id @default(uuid())
+  name   String @unique
+  symbol String @unique
+}
+
+model Order {
+  id        String     @id @default(uuid())
+  userId    String
+  user      User       @relation(fields: [userId], references: [id])
+  market    String
+  price     Int
+  quantity  Int
+  type      MarketType
+  side      Side
+  status    Status
+  createdAt DateTime   @default(now())
+  fills     Fills[]
+}
+
+model Fills {
+  id       String     @id @default(uuid())
+  quantity Int
+  side     Side
+  type     TakerMaker
+  orderId  String
+  order    Order      @relation(fields: [orderId], references: [id])
+  userId   String
+  user     User       @relation(fields: [userId], references: [id])
+  price    Int
+  asset    String
+  createdAt DateTime @default(now())
+}
+
+enum Status {
+  Open
+  Filled
+  Cancelled
+}
+
+enum Side {
+  Buy
+  Sell
+}
+
+enum MarketType {
+  Market
+  Limit
+}
+
+enum TakerMaker {
+  Taker
+  Maker
 }
