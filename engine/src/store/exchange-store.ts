@@ -73,3 +73,5 @@ export const BALANCES = new Map<string, Record<string, Balance>>();
 export const ORDERBOOKS = new Map<string, OrderBook>();
 export const ORDERS = new Map<string, OrderRecord>();
 export const FILLS: Fill[] = [];
+export const sortedBids : number[] = [];
+export const sortedAsks : number[] = [];

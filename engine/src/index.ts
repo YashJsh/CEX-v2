@@ -1,9 +1,13 @@
 import "dotenv/config";
 import { createClient } from "redis";
 import { env } from "./utils/env.js";
-import { BALANCES, FILLS, ORDERBOOKS, ORDERS, type Balance, type Fill, type OrderBook, type OrderRecord, type OrderType, type RestingOrder } from "./store/exchange-store.js";
+import { BALANCES, FILLS, ORDERBOOKS, ORDERS, sortedAsks, sortedBids, type Balance, type Fill, type OrderBook, type OrderRecord, type OrderType, type RestingOrder } from "./store/exchange-store.js";
 import type { CancelOrder, CreateOrderPayload, GetDepth, GetOrder, GetUserBalance } from "./utils/types.js";
 import { uuid } from "uuidv4";
+import { symbolName } from "typescript";
+import { sortAsks, sortBids } from "./utils/sorted.js";
+import { removeAsksFromBook, removeBidFromBook } from "./utils/remove_order_book.js";
+import { addAsks, addBids } from "./utils/add_to_book.js";
 
 export type EngineCommandType =
   | "create_order"
@@ -34,8 +38,8 @@ const addOrderBooks = () => {
 
   console.log("Orderbook Initialized\n", "BTC book : ", ORDERBOOKS.get("BTC"), "USD book : ", ORDERBOOKS.get("USD"), "SOL Book : ", ORDERBOOKS.get("SOL"));
 }
-addOrderBooks();
 
+addOrderBooks();
 
 const brokerClient = createClient({ url: env.redisUrl }).on("error", (error) => {
   console.error("Redis broker client error", error);
@@ -48,84 +52,88 @@ const responseClient = createClient({ url: env.redisUrl }).on("error", (error) =
 await Promise.all([brokerClient.connect(), responseClient.connect()]);
 
 
-async function sendResponse(responseQueue: string, response: EngineResponse): Promise<void> {
+export async function sendResponse(responseQueue: string, response: EngineResponse): Promise<void> {
   await responseClient.lPush(responseQueue, JSON.stringify(response));
 }
 
 function handleEngineRequest(message: EngineRequest) {
+
+
   if (message.type == "create_order") {
     const payload = message.payload as unknown as CreateOrderPayload;
     if (!payload) {
       throw new Error("Wrong Payload");
     }
-
     const type = payload.type;
+
+    let orderbook = ORDERBOOKS.get(payload.symbol);
+    if (!orderbook) {
+      console.log("OrderBook is : ", orderbook);
+      throw new Error("Orderbook is not present");
+    }
+    let buyOrderId = uuid();
+    // Push to the orders as well first.
+    let userOrder: OrderRecord = {
+      orderId: buyOrderId,
+      userId: payload.userId,
+      side: payload.side,
+      type: payload.type,
+      symbol: payload.symbol,
+      price: payload.price,
+      qty: payload.qty,
+      filledQty: 0,
+      status: "open",
+      fills: [],
+      createdAt: Date.now()
+    }
+
+    ORDERS.set(buyOrderId, userOrder);
+
+    if (payload.side == "buy") {
+      sortBids(userOrder);
+    } else {
+      sortAsks(userOrder);
+    }
+
     if (type == "limit") {
       if (payload.side == "buy") {
         console.log("Payload for this buying order is :::", payload);
-        let buyOrderId = uuid();
-
-
-        let orderbook = ORDERBOOKS.get(payload.symbol);
-        console.log("ORderBook");
-        if (!orderbook) {
-
-          console.log("OrderBook is : ", orderbook);
-          throw new Error("Orderbook is not present");
-        }
-
-        // Push to the orders as well first.
-        let userOrder : OrderRecord  = {
-          orderId: buyOrderId,
-          userId: payload.userId,
-          side: payload.side,
-          type: payload.type,
-          symbol: payload.symbol,
-          price: payload.price,
-          qty: payload.qty,
-          filledQty: 0,
-          status: "open",
-          fills: [],
-          createdAt: Date.now()
-        }
-
-        ORDERS.set(buyOrderId, userOrder);
 
         let filledOrder = [];
         for (const [price, orders] of orderbook?.asks) {
           if (price <= payload.price!) {
             for (let i = 0; i < orders.length; i++) {
-        
-              const buyingOrder = orders[i];
-              if (!buyingOrder) {
+
+              const sellingOrder = orders[i];
+              if (!sellingOrder) {
                 continue;
               }
-              const sellingQty = Math.min(buyingOrder?.qty, payload.qty);
+              const sellingQty = Math.min(sellingOrder?.qty, payload.qty);
               //Fill some order;
               const fill: Fill = {
                 buyOrderId: buyOrderId,
                 fillId: uuid(),
-                price: buyingOrder.price,
+                price: sellingOrder.price,
                 qty: sellingQty,
-                symbol: buyingOrder.symbol,
+                symbol: sellingOrder.symbol,
                 createdAt: Date.now(),
-                sellOrderId: buyingOrder.orderId
+                sellOrderId: sellingOrder.orderId
               }
 
               filledOrder.push(fill);
 
-              if (buyingOrder.qty != 0) {
-                buyingOrder.qty -= sellingQty
-              } else {
+              sellingOrder.qty -= sellingQty;
+              payload.qty -= sellingQty;
+
+              if (sellingOrder.qty === 0) {
                 orders.splice(i, 1);
+                i--;
               }
 
-              payload.qty -= sellingQty;
-              
               FILLS.push(fill);
 
               let order = ORDERS.get(buyOrderId);
-              if (!order){
+              if (!order) {
                 throw new Error("ORDER doesn't exists");
               }
               order.fills.push(fill);
@@ -138,7 +146,7 @@ function handleEngineRequest(message: EngineRequest) {
                   data: {
                     "status": "filled",
                     "filledQty": fill.qty,
-                    "averagePrice": buyingOrder.price / sellingQty
+                    "averagePrice": sellingOrder.price / sellingQty
                   }
                 })
                 console.log("OrderMatched Successfully")
@@ -153,9 +161,10 @@ function handleEngineRequest(message: EngineRequest) {
                   data: {
                     "status": "partially_filled",
                     "filledQty": fill.qty,
-                    "averagePrice": buyingOrder.price / sellingQty
+                    "averagePrice": sellingOrder.price / sellingQty
                   }
                 })
+                return;
               }
             }
           }
@@ -167,28 +176,29 @@ function handleEngineRequest(message: EngineRequest) {
           //   }
           // })
         }
-        addBids(payload, orderbook, message);
+        addBids(payload, orderbook, message, buyOrderId);
       } else {
         console.log("Limit sell ORder :::");
         console.log("Payload for this order is :::", payload);
-        let sellOrderId = "sellOrderId";
+        let sellOrderId = uuid();
 
         let orderbook = ORDERBOOKS.get(payload.symbol);
         if (!orderbook) {
           throw new Error("Orderbook is not present");
         }
-        for (const [price, order] of orderbook?.bids) {
+        for (const [price, orders] of orderbook?.bids) {
           if (price >= payload.price!) {
-            for (let i = 0; i < order.length; i++) {
-              const buyingOrder = order[i];
+            for (let i = 0; i < orders.length; i++) {
+              const buyingOrder = orders[i];
               if (!buyingOrder) {
                 continue;
               }
               const buyingQty = Math.min(buyingOrder?.qty, payload.qty);
               //Fill some order;
+              const fillOrderId = uuid();
               const fill: Fill = {
                 buyOrderId: sellOrderId,
-                fillId: "fillOrderId",
+                fillId: fillOrderId,
                 price: buyingOrder.price,
                 qty: buyingQty,
                 symbol: buyingOrder.symbol,
@@ -196,16 +206,19 @@ function handleEngineRequest(message: EngineRequest) {
                 sellOrderId: buyingOrder.orderId
               }
 
-              if (buyingOrder.qty != 0) {
-                buyingOrder.qty -= buyingQty
-              } else {
-                order.splice(i, 1);
+              buyingOrder.qty -= buyingQty;
+
+              if (buyingOrder.qty === 0) {
+                orders.splice(i, 1);
+                i--;
               }
               console.log("Payload qty is : ", payload.qty);
               console.log("Buying qty is : ", buyingQty);
               payload.qty -= buyingQty;
 
               FILLS.push(fill);
+
+              
 
               if (payload.qty == 0) {
                 sendResponse(process.env.RESPONSE_QUEUE!, {
@@ -223,6 +236,7 @@ function handleEngineRequest(message: EngineRequest) {
               }
               else {
                 //Partial fill case : 
+                
                 sendResponse(process.env.RESPONSE_QUEUE!, {
                   correlationId: message.correlationId,
                   ok: true,
@@ -234,12 +248,16 @@ function handleEngineRequest(message: EngineRequest) {
                 })
               }
             }
+            return;
           }
         }
-        addAsks(payload, orderbook, message);
+        addAsks(payload, orderbook, message, sellOrderId);
       }
     }
+
   }
+
+
   if (message.type == "get_order") {
     const payload: GetOrder = message.payload as unknown as GetOrder;
     const { userId, orderId } = payload;
@@ -312,84 +330,139 @@ function handleEngineRequest(message: EngineRequest) {
       throw new Error("Order is closed");
     }
   }
+
   if (message.type == "get_depth") {
-    const payload: GetDepth = message.payload as unknown as GetDepth;
+   
+    const payload = message.payload as unknown as GetDepth;
+    const orderBook = ORDERBOOKS.get(payload.symbol);
+    console.log(orderBook);
+    if (!orderBook) {
+      sendResponse(process.env.RESPONSE_QUEUE!, {
+        correlationId: message.correlationId,
+        ok: true,
+        data: {
+          "symbol": payload.symbol,
+          bids: [],
+          asks: []
+        }
+      });
+      return;
+    }
+    console.log("Orderbook at price 100 is : ", orderBook.bids.values());
+
+    let bids = [];
+    let asks = [];
+
+    for (let i = 0; i < sortedBids.length; i++) {
+      const bidsPerPrice = orderBook.bids.get(sortedBids[i]!);
+      if (!bidsPerPrice) {
+        continue;
+      }
+      let qty = 0;
+      for (let i = 0; i < bidsPerPrice?.length!; i++) {
+        const bid = bidsPerPrice[i];
+        console.log("Bid found at price", bidsPerPrice, "is", bid);
+        if (!bid) {
+          throw new Error("Bid doesn't exists");
+        }
+        console.log("ADDING", bid.qty);
+        qty += bid?.qty;
+      }
+      let obj = {
+        price: sortedBids[i]!,
+        qty: qty
+      }
+      bids.push(obj);
+    }
+    for (let i = 0; i < sortedAsks.length; i++) {
+      const asksPerPrice = orderBook.asks.get(sortedAsks[i]!);
+      if (!asksPerPrice) {
+        continue;
+      }
+      let qty = 0;
+      for (let i = 0; i < asksPerPrice?.length!; i++) {
+        const ask = asksPerPrice[i];
+        if (!ask) {
+          throw new Error("Bid doesn't exists");
+          return;
+        }
+        qty += ask?.qty;
+      }
+      let obj = {
+        price: sortedAsks[i]!,
+        qty: qty
+      }
+      asks.push(obj);
+    }
+    //Sending Response when there is something in the book.
+    console.log("Sending Response when there is something in the book.");
+    sendResponse(process.env.RESPONSE_QUEUE!, {
+      correlationId: message.correlationId,
+      ok: true,
+      data: {
+        "symbol": payload.symbol,
+        bids,
+        asks
+      }
+    })
+
   }
+
+
   if (message.type == "get_user_balance") {
     const payload: GetUserBalance = message.payload as unknown as GetUserBalance;
   }
+
+
   if (message.type == "cancel_order") {
     const payload: CancelOrder = message.payload as unknown as CancelOrder;
+    const { userId, orderId } = payload;
+    const order = ORDERS.get(orderId);
+    const book = ORDERBOOKS.get(order?.symbol!);
+    if (!book) {
+      console.log("Book is not present");
+      return;
+    }
+
+    if (!order) {
+      console.log("Order not found");
+      return;
+    }
+    if (order.status == "cancelled") {
+      throw new Error("Order is already cancelled");
+    }
+    if (order.status == "filled") {
+      throw new Error("filled ordered cannot be cancelled");
+    }
+    if (order.side == "buy") {
+      removeBidFromBook(userId, orderId, order, book);
+     
+      sendResponse(process.env.RESPONSE_QUEUE!, {
+        correlationId: message.correlationId,
+        ok: true,
+        data: {
+          status : order.status,
+          qty : order.qty,
+          filledQty : order.filledQty
+        }
+      })
+      
+    } else {
+      removeAsksFromBook(userId, orderId, order, book);
+      sendResponse(process.env.RESPONSE_QUEUE!, {
+        correlationId: message.correlationId,
+        ok: true,
+        data: {
+          status : order.status,
+          qty : order.qty,
+          filledQty : order.filledQty
+        }
+      })
+    }
   }
 }
 
 console.log(`Engine listening on Redis queue: ${env.incomingQueue}`);
-
-const addBids = async (order: CreateOrderPayload, orderbook: OrderBook, message: EngineRequest): Promise<void> => {
-  let restingOrder: RestingOrder = {
-    orderId: "orderId",
-    userId: order.userId,
-    side: order.side,
-    type: "limit",
-    symbol: order.symbol,
-    price: order.price!,
-    qty: order.qty,
-    filledQty: 0,
-    status: "open",
-    createdAt: Date.now()
-  }
-
-  if (!orderbook.bids.has(restingOrder.price)) {
-    orderbook.bids.set(restingOrder.price, [restingOrder]);
-    console.log("ORderbook after pushing for the first time is  : ", orderbook);
-  }
-
-  for (const [price, orders] of orderbook.bids) {
-    if (price <= restingOrder.price) {
-      orders.push(restingOrder);
-      console.log("ORderbook after pushing is : ", orderbook);
-    }
-  }
-  console.log("Resting order is : ", restingOrder);
-  console.log("ORDERBOOK IS : ", ORDERBOOKS.get("BTC"));
-  sendResponse(process.env.RESPONSE_QUEUE!, {
-    correlationId: message.correlationId,
-    ok: true,
-    data: restingOrder
-  })
-}
-
-const addAsks = async (order: CreateOrderPayload, orderbook: OrderBook, message: EngineRequest): Promise<void> => {
-  let restingOrder: RestingOrder = {
-    orderId: "orderId",
-    userId: order.userId,
-    side: order.side,
-    type: "limit",
-    symbol: order.symbol,
-    price: order.price!,
-    qty: order.qty,
-    filledQty: 0,
-    status: "open",
-    createdAt: Date.now()
-  }
-  if (!orderbook.asks.has(restingOrder.price)) {
-    orderbook.asks.set(restingOrder.price, [restingOrder]);
-    console.log("ORderbook after pushing for the first time is  : ", orderbook);
-  }
-
-  for (const [price, orders] of orderbook.asks) {
-    if (price <= restingOrder.price) {
-      orders.push(restingOrder);
-    }
-  }
-  console.log("ORDERBOOK IS : ", ORDERBOOKS.get("BTC"));
-  sendResponse(process.env.RESPONSE_QUEUE!, {
-    correlationId: message.correlationId,
-    ok: true,
-    data: restingOrder
-  })
-
-}
 
 //Infinite loop
 for (; ;) {

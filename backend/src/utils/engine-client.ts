@@ -42,7 +42,7 @@ export async function sendToEngine(
   };
 
   await publisher.lPush(env.incomingQueue, JSON.stringify(message));
-  
+
   return responsePromise;
 }
 
