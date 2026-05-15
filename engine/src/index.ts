@@ -53,18 +53,16 @@ const responseClient = createClient({ url: env.redisUrl }).on("error", (error) =
 
 await Promise.all([brokerClient.connect(), responseClient.connect()]);
 
-//ORder matched and updated in the book, but not in the order's array why?
-
 
 export async function sendResponse(responseQueue: string, response: EngineResponse): Promise<void> {
   await responseClient.lPush(responseQueue, JSON.stringify(response));
 }
 
 function handleEngineRequest(message: EngineRequest) {
-  if (message.type == "new_user"){
+  if (message.type == "new_user") {
     const userId = message.payload as unknown as string;
     const userBalance = BALANCES.get(userId);
-    if (!userBalance){
+    if (!userBalance) {
       const balance = BALANCES.set(userId, {
         USD: {
           available: 0,
@@ -79,14 +77,14 @@ function handleEngineRequest(message: EngineRequest) {
     }
   }
 
-  if (message.type == "update_balance"){
-    const data = message.payload as unknown as { symbol : string, userId : string, amount : number};
+  if (message.type == "update_balance") {
+    const data = message.payload as unknown as { symbol: string, userId: string, amount: number };
     const userBalance = BALANCES.get(data.userId);
-    if (!userBalance){
+    if (!userBalance) {
       console.log("No initialization of the wallet found");
       return;
     }
-    if (data.symbol == "USD"){
+    if (data.symbol == "USD") {
       const usd = userBalance.USD;
       usd!.available += data.amount;
       console.log("Balance Updated for USD", usd?.available);
@@ -94,16 +92,16 @@ function handleEngineRequest(message: EngineRequest) {
         correlationId: message.correlationId,
         ok: true,
         data: {
-          "status" : "balanceUpdated",
-          "balance" : {
-            available : usd?.available,
-            locked : usd?.locked
+          "status": "balanceUpdated",
+          "balance": {
+            available: usd?.available,
+            locked: usd?.locked
           }
         }
       })
       return;
     }
-    else if (data.symbol == "INR"){
+    else if (data.symbol == "INR") {
       const inr = userBalance.INR;
       inr!.available += data.amount;
       console.log("Balance Updated for INR", inr?.available);
@@ -111,16 +109,16 @@ function handleEngineRequest(message: EngineRequest) {
         correlationId: message.correlationId,
         ok: true,
         data: {
-          "status" : "balanceUpdated",
-          "balance" : {
-            available : inr?.available,
-            locked : inr?.locked
+          "status": "balanceUpdated",
+          "balance": {
+            available: inr?.available,
+            locked: inr?.locked
           }
         }
       })
       return;
     }
-    else{
+    else {
       sendResponse(process.env.RESPONSE_QUEUE!, {
         correlationId: message.correlationId,
         ok: false,
@@ -194,7 +192,7 @@ function handleEngineRequest(message: EngineRequest) {
               filledOrder.push(fill);
 
               sellingOrder.qty -= sellingQty;
-             
+
               payload.qty -= sellingQty;
 
               if (sellingOrder.qty === 0) {
@@ -210,8 +208,23 @@ function handleEngineRequest(message: EngineRequest) {
               }
               order.filledQty += sellingQty;
               order.qty -= sellingQty;
-
               order.fills.push(fill);
+
+              const restingOrder = ORDERS.get(sellingOrder.orderId);
+              if (!restingOrder) {
+                throw new Error("REsting order doesn't exists");
+              }
+
+              restingOrder.filledQty += sellingQty;
+              restingOrder.qty -= sellingQty;
+              restingOrder.fills.push(fill);
+
+              if (restingOrder.qty === 0) {
+                restingOrder.status = "filled";
+              } else {
+                restingOrder.status = "partially_filled";
+              }
+
 
               if (payload.qty == 0) {
                 order.status == "filled"
@@ -297,9 +310,22 @@ function handleEngineRequest(message: EngineRequest) {
               }
               order.filledQty += buyingQty;
               order.qty -= buyingQty;
-
               order.fills.push(fill);
 
+              const restingOrder = ORDERS.get(buyingOrder.orderId);
+              if (!restingOrder) {
+                throw new Error("REsting order doesn't exists");
+              }
+
+              restingOrder.filledQty += buyingQty;
+              restingOrder.qty -= buyingQty;
+              restingOrder.fills.push(fill);
+
+              if (restingOrder.qty === 0) {
+                restingOrder.status = "filled";
+              } else {
+                restingOrder.status = "partially_filled";
+              }
 
               if (payload.qty == 0) {
                 sendResponse(process.env.RESPONSE_QUEUE!, {
@@ -336,7 +362,6 @@ function handleEngineRequest(message: EngineRequest) {
     }
 
   }
-
 
   if (message.type == "get_order") {
     const payload: GetOrder = message.payload as unknown as GetOrder;
@@ -412,6 +437,7 @@ function handleEngineRequest(message: EngineRequest) {
   }
 
   if (message.type == "get_depth") {
+
 
     const payload = message.payload as unknown as GetDepth;
     const orderBook = ORDERBOOKS.get(payload.symbol);
@@ -497,6 +523,46 @@ function handleEngineRequest(message: EngineRequest) {
 
   if (message.type == "get_user_balance") {
     const payload: GetUserBalance = message.payload as unknown as GetUserBalance;
+    const balance = BALANCES.get(payload.userId);
+    if (!balance) {
+      console.log("No balance found, user may not be initialized yet");
+      return;
+    }
+    const USDBalance = balance.USD;
+    const INRBalance = balance.INR;
+
+    if (USDBalance?.available == 0 && USDBalance.locked == 0 && INRBalance?.available == 0 && INRBalance.locked == 0) {
+      sendResponse(process.env.RESPONSE_QUEUE!, {
+        correlationId: message.correlationId,
+        ok: true,
+        data: {
+          "USD": {
+            available: USDBalance.available,
+            locked: USDBalance.locked
+          },
+          "INR": {
+            available: INRBalance.available,
+            locked: INRBalance.locked
+          }
+        }
+      })
+      return;
+    }
+    sendResponse(process.env.RESPONSE_QUEUE!, {
+      correlationId: message.correlationId,
+      ok: true,
+      data: {
+        "USD": {
+          available: USDBalance?.available,
+          locked: USDBalance?.locked
+        },
+        "INR": {
+          available: INRBalance?.available,
+          locked: INRBalance?.locked
+        }
+      }
+    })
+
   }
 
 
