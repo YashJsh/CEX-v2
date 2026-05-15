@@ -1,5 +1,6 @@
 import { Router } from "express";
 import {
+    addBalance,
   cancelOrder,
   createOrder,
   getBalance,
@@ -16,3 +17,4 @@ exchangeRouter.get("/depth/:symbol", requireAuth, asyncHandler(getDepth));
 exchangeRouter.get("/balance", requireAuth, asyncHandler(getBalance));
 exchangeRouter.get("/order/:orderId", requireAuth, asyncHandler(getOrder));
 exchangeRouter.delete("/order/:orderId", requireAuth, asyncHandler(cancelOrder));
+exchangeRouter.post("/balance", requireAuth, asyncHandler(addBalance));

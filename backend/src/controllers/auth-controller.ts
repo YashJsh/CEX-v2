@@ -4,6 +4,7 @@ import { prisma } from "../db.js";
 import { authSchema } from "../types/auth-schema.js";
 import { createToken } from "../utils/auth.js";
 import { sendValidationError } from "../utils/validation.js";
+import { sendToEngine } from "../utils/engine-client.js";
 
 export async function signup(req: Request, res: Response): Promise<void> {
   const parsedBody = authSchema.safeParse(req.body);
@@ -21,6 +22,10 @@ export async function signup(req: Request, res: Response): Promise<void> {
         password: hashedPassword,
       },
     });
+
+    await sendToEngine("new_user", {
+      userId : user.id
+    })
 
     res.status(201).json({
       token: createToken({ userId: user.id }),
@@ -46,6 +51,10 @@ export async function signin(req: Request, res: Response): Promise<void> {
     where : {   
       username : parsedBody.data?.username
     }
+  });
+
+  const engineResponse = await sendToEngine("new_user", {
+    balance : 0
   })
 
   if (!checkUser){
@@ -61,6 +70,8 @@ export async function signin(req: Request, res: Response): Promise<void> {
     })
     return;
   }
+
+  
 
   res.status(200).json({
     token : createToken({userId : checkUser.id})

@@ -14,7 +14,9 @@ export type EngineCommandType =
   | "get_depth"
   | "get_user_balance"
   | "get_order"
-  | "cancel_order";
+  | "cancel_order"
+  | "new_user"
+  | "update_balance";
 
 export interface EngineRequest {
   correlationId: string;
@@ -51,13 +53,81 @@ const responseClient = createClient({ url: env.redisUrl }).on("error", (error) =
 
 await Promise.all([brokerClient.connect(), responseClient.connect()]);
 
+//ORder matched and updated in the book, but not in the order's array why?
+
 
 export async function sendResponse(responseQueue: string, response: EngineResponse): Promise<void> {
   await responseClient.lPush(responseQueue, JSON.stringify(response));
 }
 
 function handleEngineRequest(message: EngineRequest) {
+  if (message.type == "new_user"){
+    const userId = message.payload as unknown as string;
+    const userBalance = BALANCES.get(userId);
+    if (!userBalance){
+      const balance = BALANCES.set(userId, {
+        USD: {
+          available: 0,
+          locked: 0
+        },
+        INR: {
+          available: 0,
+          locked: 0
+        }
+      });
+      console.log("Balance Initialized", balance);
+    }
+  }
 
+  if (message.type == "update_balance"){
+    const data = message.payload as unknown as { symbol : string, userId : string, amount : number};
+    const userBalance = BALANCES.get(data.userId);
+    if (!userBalance){
+      console.log("No initialization of the wallet found");
+      return;
+    }
+    if (data.symbol == "USD"){
+      const usd = userBalance.USD;
+      usd!.available += data.amount;
+      console.log("Balance Updated for USD", usd?.available);
+      sendResponse(process.env.RESPONSE_QUEUE!, {
+        correlationId: message.correlationId,
+        ok: true,
+        data: {
+          "status" : "balanceUpdated",
+          "balance" : {
+            available : usd?.available,
+            locked : usd?.locked
+          }
+        }
+      })
+      return;
+    }
+    else if (data.symbol == "INR"){
+      const inr = userBalance.INR;
+      inr!.available += data.amount;
+      console.log("Balance Updated for INR", inr?.available);
+      sendResponse(process.env.RESPONSE_QUEUE!, {
+        correlationId: message.correlationId,
+        ok: true,
+        data: {
+          "status" : "balanceUpdated",
+          "balance" : {
+            available : inr?.available,
+            locked : inr?.locked
+          }
+        }
+      })
+      return;
+    }
+    else{
+      sendResponse(process.env.RESPONSE_QUEUE!, {
+        correlationId: message.correlationId,
+        ok: false,
+        error: "Only USD and INR are supported"
+      })
+    }
+  }
 
   if (message.type == "create_order") {
     const payload = message.payload as unknown as CreateOrderPayload;
@@ -71,10 +141,10 @@ function handleEngineRequest(message: EngineRequest) {
       console.log("OrderBook is : ", orderbook);
       throw new Error("Orderbook is not present");
     }
-    let buyOrderId = uuid();
-    // Push to the orders as well first.
+
+    let orderId = uuid();
     let userOrder: OrderRecord = {
-      orderId: buyOrderId,
+      orderId: orderId,
       userId: payload.userId,
       side: payload.side,
       type: payload.type,
@@ -87,7 +157,7 @@ function handleEngineRequest(message: EngineRequest) {
       createdAt: Date.now()
     }
 
-    ORDERS.set(buyOrderId, userOrder);
+    ORDERS.set(orderId, userOrder);
 
     if (payload.side == "buy") {
       sortBids(userOrder);
@@ -100,6 +170,7 @@ function handleEngineRequest(message: EngineRequest) {
         console.log("Payload for this buying order is :::", payload);
 
         let filledOrder = [];
+
         for (const [price, orders] of orderbook?.asks) {
           if (price <= payload.price!) {
             for (let i = 0; i < orders.length; i++) {
@@ -111,7 +182,7 @@ function handleEngineRequest(message: EngineRequest) {
               const sellingQty = Math.min(sellingOrder?.qty, payload.qty);
               //Fill some order;
               const fill: Fill = {
-                buyOrderId: buyOrderId,
+                buyOrderId: orderId,
                 fillId: uuid(),
                 price: sellingOrder.price,
                 qty: sellingQty,
@@ -123,6 +194,7 @@ function handleEngineRequest(message: EngineRequest) {
               filledOrder.push(fill);
 
               sellingOrder.qty -= sellingQty;
+             
               payload.qty -= sellingQty;
 
               if (sellingOrder.qty === 0) {
@@ -132,10 +204,13 @@ function handleEngineRequest(message: EngineRequest) {
 
               FILLS.push(fill);
 
-              let order = ORDERS.get(buyOrderId);
+              const order = ORDERS.get(orderId);
               if (!order) {
                 throw new Error("ORDER doesn't exists");
               }
+              order.filledQty += sellingQty;
+              order.qty -= sellingQty;
+
               order.fills.push(fill);
 
               if (payload.qty == 0) {
@@ -176,11 +251,9 @@ function handleEngineRequest(message: EngineRequest) {
           //   }
           // })
         }
-        addBids(payload, orderbook, message, buyOrderId);
+        addBids(payload, orderbook, message, orderId);
       } else {
         console.log("Limit sell ORder :::");
-        console.log("Payload for this order is :::", payload);
-        let sellOrderId = uuid();
 
         let orderbook = ORDERBOOKS.get(payload.symbol);
         if (!orderbook) {
@@ -197,7 +270,7 @@ function handleEngineRequest(message: EngineRequest) {
               //Fill some order;
               const fillOrderId = uuid();
               const fill: Fill = {
-                buyOrderId: sellOrderId,
+                buyOrderId: orderId,
                 fillId: fillOrderId,
                 price: buyingOrder.price,
                 qty: buyingQty,
@@ -218,7 +291,15 @@ function handleEngineRequest(message: EngineRequest) {
 
               FILLS.push(fill);
 
-              
+              const order = ORDERS.get(orderId);
+              if (!order) {
+                throw new Error("ORDER doesn't exists");
+              }
+              order.filledQty += buyingQty;
+              order.qty -= buyingQty;
+
+              order.fills.push(fill);
+
 
               if (payload.qty == 0) {
                 sendResponse(process.env.RESPONSE_QUEUE!, {
@@ -236,7 +317,6 @@ function handleEngineRequest(message: EngineRequest) {
               }
               else {
                 //Partial fill case : 
-                
                 sendResponse(process.env.RESPONSE_QUEUE!, {
                   correlationId: message.correlationId,
                   ok: true,
@@ -251,7 +331,7 @@ function handleEngineRequest(message: EngineRequest) {
             return;
           }
         }
-        addAsks(payload, orderbook, message, sellOrderId);
+        addAsks(payload, orderbook, message, orderId);
       }
     }
 
@@ -332,7 +412,7 @@ function handleEngineRequest(message: EngineRequest) {
   }
 
   if (message.type == "get_depth") {
-   
+
     const payload = message.payload as unknown as GetDepth;
     const orderBook = ORDERBOOKS.get(payload.symbol);
     console.log(orderBook);
@@ -372,6 +452,9 @@ function handleEngineRequest(message: EngineRequest) {
         price: sortedBids[i]!,
         qty: qty
       }
+      if (qty == 0) {
+        continue;
+      }
       bids.push(obj);
     }
     for (let i = 0; i < sortedAsks.length; i++) {
@@ -391,6 +474,9 @@ function handleEngineRequest(message: EngineRequest) {
       let obj = {
         price: sortedAsks[i]!,
         qty: qty
+      }
+      if (qty == 0) {
+        continue;
       }
       asks.push(obj);
     }
@@ -418,7 +504,10 @@ function handleEngineRequest(message: EngineRequest) {
     const payload: CancelOrder = message.payload as unknown as CancelOrder;
     const { userId, orderId } = payload;
     const order = ORDERS.get(orderId);
+    console.log("Order", order);
     const book = ORDERBOOKS.get(order?.symbol!);
+    const values = book?.bids.values();
+    console.log("Valued in the cancel-order part ", values);
     if (!book) {
       console.log("Book is not present");
       return;
@@ -436,26 +525,25 @@ function handleEngineRequest(message: EngineRequest) {
     }
     if (order.side == "buy") {
       removeBidFromBook(userId, orderId, order, book);
-     
       sendResponse(process.env.RESPONSE_QUEUE!, {
         correlationId: message.correlationId,
         ok: true,
         data: {
-          status : order.status,
-          qty : order.qty,
-          filledQty : order.filledQty
+          status: order.status,
+          qty: order.qty,
+          filledQty: order.filledQty
         }
       })
-      
+
     } else {
       removeAsksFromBook(userId, orderId, order, book);
       sendResponse(process.env.RESPONSE_QUEUE!, {
         correlationId: message.correlationId,
         ok: true,
         data: {
-          status : order.status,
-          qty : order.qty,
-          filledQty : order.filledQty
+          status: order.status,
+          qty: order.qty,
+          filledQty: order.filledQty
         }
       })
     }

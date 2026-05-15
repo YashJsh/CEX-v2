@@ -3,13 +3,30 @@ import {
   orderBodySchema,
   orderIdParamSchema,
   symbolParamSchema,
+  updateBalanceSchema,
 } from "../types/exchange-schema.js";
-import { sendToEngine } from "../utils/engine-client.js";
 import { sendValidationError } from "../utils/validation.js";
+import { sendToEngine } from "../utils/engine-client.js";
 
 function getUserId(req: Request): string {
   if (!req.userId) throw new Error("Missing authenticated user");
   return req.userId;
+}
+
+export async function addBalance(req : Request, res : Response): Promise<void>{
+  const userId = getUserId(req);
+  const parsedBody = updateBalanceSchema.safeParse(req.body);
+  if (!parsedBody.success) {
+    sendValidationError(res, parsedBody.error);
+    return;
+  }
+  const {amount, symbol} = parsedBody.data;
+  const engineResponse = await sendToEngine("update_balance", {
+    symbol : symbol, userId : userId, amount : amount
+  })
+  res.status(engineResponse.ok ? 200 : 400).json(engineResponse.ok ? engineResponse.data : {
+    error: engineResponse.error,
+  });
 }
 
 export async function createOrder(req: Request, res: Response): Promise<void> {
