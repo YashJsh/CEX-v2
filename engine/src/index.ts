@@ -4,7 +4,6 @@ import { env } from "./utils/env.js";
 import { BALANCES, FILLS, ORDERBOOKS, ORDERS, sortedAsks, sortedBids, type Balance, type Fill, type OrderBook, type OrderRecord, type OrderType, type RestingOrder } from "./store/exchange-store.js";
 import type { CancelOrder, CreateOrderPayload, GetDepth, GetOrder, GetUserBalance } from "./utils/types.js";
 import { uuid } from "uuidv4";
-import { symbolName } from "typescript";
 import { sortAsks, sortBids } from "./utils/sorted.js";
 import { removeAsksFromBook, removeBidFromBook } from "./utils/remove_order_book.js";
 import { addAsks, addBids } from "./utils/add_to_book.js";
@@ -157,7 +156,7 @@ function handleEngineRequest(message: EngineRequest) {
 
     ORDERS.set(orderId, userOrder);
 
-    if (payload.side == "buy") {
+    if (payload.side == "buy" && payload.type == "limit") {
       sortBids(userOrder);
     } else {
       sortAsks(userOrder);
@@ -227,7 +226,7 @@ function handleEngineRequest(message: EngineRequest) {
 
 
               if (payload.qty == 0) {
-                order.status == "filled"
+                order.status = "filled"
                 sendResponse(process.env.RESPONSE_QUEUE!, {
                   correlationId: message.correlationId,
                   ok: true,
@@ -241,7 +240,7 @@ function handleEngineRequest(message: EngineRequest) {
                 return;
               }
               else {
-                order.status == "partially_filled"
+                order.status = "partially_filled"
                 //Partial fill case : 
                 sendResponse(process.env.RESPONSE_QUEUE!, {
                   correlationId: message.correlationId,
@@ -328,6 +327,7 @@ function handleEngineRequest(message: EngineRequest) {
               }
 
               if (payload.qty == 0) {
+                order.status = "filled"
                 sendResponse(process.env.RESPONSE_QUEUE!, {
                   correlationId: message.correlationId,
                   ok: true,
@@ -342,6 +342,7 @@ function handleEngineRequest(message: EngineRequest) {
                 return;
               }
               else {
+                order.status = "partially_filled"
                 //Partial fill case : 
                 sendResponse(process.env.RESPONSE_QUEUE!, {
                   correlationId: message.correlationId,
@@ -361,6 +362,236 @@ function handleEngineRequest(message: EngineRequest) {
       }
     }
 
+
+    if (type == "market" && payload.side == "buy") {
+      let filledOrder = [];
+      for (let i = 0; i < sortedAsks.length; i++) {
+
+        if (payload.qty == 0) {
+          return;
+        }
+
+        const best_price = sortedAsks[i];
+        if (!best_price) {
+          console.log("No best price available for the order to match, should cancel order");
+          return;
+        }
+        const orders_to_match = orderbook.asks.get(best_price);
+        if (!orders_to_match) {
+          console.log("No order is there from the opposite side");
+          return;
+        }
+        for (let i = 0; i < orders_to_match?.length; i++) {
+          let sellingOrder = orders_to_match[i];
+
+          if (!sellingOrder) {
+            continue;
+          }
+          const sellingQty = Math.min(sellingOrder?.qty, payload.qty);
+          //Fill some order;
+          const fill: Fill = {
+            buyOrderId: orderId,
+            fillId: uuid(),
+            price: sellingOrder.price,
+            qty: sellingQty,
+            symbol: sellingOrder.symbol,
+            createdAt: Date.now(),
+            sellOrderId: sellingOrder.orderId
+          }
+
+          filledOrder.push(fill);
+          FILLS.push(fill);
+
+          sellingOrder.qty -= sellingQty;
+          payload.qty -= sellingQty;
+
+
+          const order = ORDERS.get(orderId);
+          if (!order) {
+            throw new Error("ORDER doesn't exists");
+          }
+          order.filledQty += sellingQty;
+          order.qty -= sellingQty;
+          order.fills.push(fill);
+
+          const restingOrder = ORDERS.get(sellingOrder.orderId);
+          if (!restingOrder) {
+            throw new Error("REsting order doesn't exists");
+          }
+
+          restingOrder.filledQty += sellingQty;
+          restingOrder.qty -= sellingQty;
+          restingOrder.fills.push(fill);
+
+          if (restingOrder.qty === 0) {
+            restingOrder.status = "filled";
+          } else {
+            restingOrder.status = "partially_filled";
+          }
+
+          if (sellingOrder.qty === 0) {
+            orders_to_match.splice(i, 1);
+            i--;
+          }
+        }
+        if (orders_to_match.length == 0) {
+          orderbook.asks.delete(best_price);
+          sortedAsks.splice(i, 1);
+          i--;
+        }
+      }
+
+      const incomingOrder = ORDERS.get(orderId);
+      if (!incomingOrder) {
+        throw new Error("Incoming order not found");
+      }
+
+      if (incomingOrder.qty === 0) {
+        incomingOrder.status = "filled";
+        sendResponse(process.env.RESPONSE_QUEUE!, {
+          correlationId: message.correlationId,
+          ok: true,
+          data: {
+            "status": "filled",
+            "filledQty": incomingOrder.qty,
+            "averagePrice": "12"
+          }
+        });
+        return;
+      }
+      else if (incomingOrder.filledQty > 0) {
+        incomingOrder.status = "partially_filled";
+        sendResponse(process.env.RESPONSE_QUEUE!, {
+          correlationId: message.correlationId,
+          ok: true,
+          data: {
+            "status": incomingOrder.status,
+            "filledQty": incomingOrder.qty,
+            "averagePrice": "12"
+          }
+        });
+        return;
+      }
+      else {
+        incomingOrder.status = "cancelled";
+        sendResponse(process.env.RESPONSE_QUEUE!, {
+          correlationId: message.correlationId,
+          ok: false,
+          error: "Order is cancelled"
+        });
+      }
+    }
+
+    if (type == "market" && payload.side == "sell") {
+      let filledOrder = [];
+      for (let i = 0; i < sortedBids.length; i++) {
+        const best_price = sortedBids[i];
+        if (!best_price) {
+          console.log("No best price available for the order to match, should cancel order");
+          return;
+        }
+        const orders_to_match = orderbook.asks.get(best_price);
+        if (!orders_to_match) {
+          console.log("No order is there from the opposite side");
+          return;
+        }
+        for (let i = 0; i < orders_to_match?.length; i++) {
+          let buyingOrder = orders_to_match[i];
+          if (!buyingOrder) {
+            continue;
+          }
+          const buyingQty = Math.min(buyingOrder?.qty, payload.qty);
+          //Fill some order;
+          const fillOrderId = uuid();
+          const fill: Fill = {
+            buyOrderId: orderId,
+            fillId: fillOrderId,
+            price: buyingOrder.price,
+            qty: buyingQty,
+            symbol: buyingOrder.symbol,
+            createdAt: Date.now(),
+            sellOrderId: buyingOrder.orderId
+          }
+
+          buyingOrder.qty -= buyingQty;
+          payload.qty -= buyingQty;
+
+          FILLS.push(fill);
+
+          const order = ORDERS.get(orderId);
+          if (!order) {
+            throw new Error("ORDER doesn't exists");
+          }
+          order.filledQty += buyingQty;
+          order.qty -= buyingQty;
+          order.fills.push(fill);
+
+          const restingOrder = ORDERS.get(buyingOrder.orderId);
+          if (!restingOrder) {
+            throw new Error("REsting order doesn't exists");
+          }
+
+          restingOrder.filledQty += buyingQty;
+          restingOrder.qty -= buyingQty;
+          restingOrder.fills.push(fill);
+
+          if (restingOrder.qty === 0) {
+            restingOrder.status = "filled";
+          } else {
+            restingOrder.status = "partially_filled";
+          }
+
+          if (buyingOrder.qty === 0) {
+            orders_to_match.splice(i, 1);
+            i--;
+          }
+        }
+        if (orders_to_match.length == 0) {
+          orderbook.asks.delete(best_price);
+          sortedAsks.splice(i, 1);
+          i--;
+        }
+      }
+      const incomingOrder = ORDERS.get(orderId);
+      if (!incomingOrder) {
+        throw new Error("Incoming order not found");
+      }
+
+      if (incomingOrder.qty === 0) {
+        incomingOrder.status = "filled";
+        sendResponse(process.env.RESPONSE_QUEUE!, {
+          correlationId: message.correlationId,
+          ok: true,
+          data: {
+            "status": "filled",
+            "filledQty": incomingOrder.qty,
+            "averagePrice": "12"
+          }
+        });
+        return;
+      }
+      else if (incomingOrder.filledQty > 0) {
+        incomingOrder.status = "partially_filled";
+        sendResponse(process.env.RESPONSE_QUEUE!, {
+          correlationId: message.correlationId,
+          ok: true,
+          data: {
+            "status": incomingOrder.status,
+            "filledQty": incomingOrder.qty,
+            "averagePrice": "12"
+          }
+        });
+        return;
+      }
+      else {
+        incomingOrder.status = "cancelled";
+        sendResponse(process.env.RESPONSE_QUEUE!, {
+          correlationId: message.correlationId,
+          ok: false,
+          error: "Order is cancelled"
+        });
+      }
+    }
   }
 
   if (message.type == "get_order") {
@@ -517,9 +748,7 @@ function handleEngineRequest(message: EngineRequest) {
         asks
       }
     })
-
   }
-
 
   if (message.type == "get_user_balance") {
     const payload: GetUserBalance = message.payload as unknown as GetUserBalance;
@@ -564,7 +793,6 @@ function handleEngineRequest(message: EngineRequest) {
     })
 
   }
-
 
   if (message.type == "cancel_order") {
     const payload: CancelOrder = message.payload as unknown as CancelOrder;
@@ -617,6 +845,12 @@ function handleEngineRequest(message: EngineRequest) {
 }
 
 console.log(`Engine listening on Redis queue: ${env.incomingQueue}`);
+
+
+
+
+
+
 
 //Infinite loop
 for (; ;) {
